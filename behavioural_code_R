@@ -1,0 +1,157 @@
+# ==============================================================================
+# Comparison of reaction time (RT) and accuracy across stimulus types
+# (reward, salience, neutral)
+# Data: Averages_RT_ACC.xlsx (sheets "acc_excl" and "RT_excl")
+# ==============================================================================
+
+# install.packages(c("readxl", "dplyr", "tidyr", "afex", "ggplot2",
+#                    "rstatix", "patchwork", "scales"))
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(afex)
+library(ggplot2)
+library(rstatix)
+library(patchwork)
+
+# Path to the data, relative to the working directory
+file_path <- "Averages_RT_ACC.xlsx"
+
+# ==============================================================================
+# Load one sheet (accuracy or RT) and convert it to long format.
+# Only participants with data in all three conditions are kept, so that the
+# ANOVA, post-hoc tests and descriptives are all based on the same sample.
+# ==============================================================================
+load_condition_data <- function(sheet_name, dv_name) {
+  read_excel(file_path, sheet = sheet_name) %>%
+    select(subj, reward = Reward, saliency = Saliency, no_reward = Neutral) %>%
+    filter(!is.na(subj)) %>%
+    filter(if_all(c(reward, saliency, no_reward), ~ !is.na(.x))) %>%
+    pivot_longer(
+      cols = c(reward, saliency, no_reward),
+      names_to = "condition",
+      values_to = dv_name
+    ) %>%
+    mutate(
+      condition = factor(condition,
+                         levels = c("reward", "saliency", "no_reward"),
+                         labels = c("Reward", "Salience", "Neutral")),
+      subj = factor(subj)
+    )
+}
+
+# ==============================================================================
+# Full analysis: descriptives, RM-ANOVA, post-hoc tests, effect sizes, plot
+# ==============================================================================
+run_analysis <- function(data_long, dv_name, dv_label) {
+
+  cat("\n==================================================================\n")
+  cat("ANALYSIS:", dv_label, "\n")
+  cat("==================================================================\n")
+  cat("Number of participants:", n_distinct(data_long$subj), "\n")
+
+  formula_dv <- as.formula(paste0(dv_name, " ~ condition"))
+
+  # ---- Descriptives ----
+  descriptives <- data_long %>%
+    group_by(condition) %>%
+    summarise(
+      n    = n(),
+      mean = mean(.data[[dv_name]]),
+      sd   = sd(.data[[dv_name]]),
+      se   = sd / sqrt(n),
+      .groups = "drop"
+    )
+  cat("\n--- Descriptive statistics ---\n")
+  print(descriptives)
+
+  # ---- Repeated-measures ANOVA (Greenhouse-Geisser correction) ----
+  aov_result <- aov_ez(
+    id = "subj",
+    dv = dv_name,
+    data = data_long,
+    within = "condition",
+    anova_table = list(correction = "GG", es = "pes")  # partial eta-squared
+  )
+  cat("\n--- Repeated-measures ANOVA ---\n")
+  print(aov_result)
+  cat("\n--- Sphericity tests and corrections ---\n")
+  print(summary(aov_result))
+
+  partial_eta_sq <- setNames(aov_result$anova_table$pes,
+                             rownames(aov_result$anova_table))
+
+  # ---- Post-hoc paired t-tests (Holm-Bonferroni corrected) ----
+  posthoc <- data_long %>%
+    pairwise_t_test(formula_dv, paired = TRUE, p.adjust.method = "holm")
+  cat("\n--- Post-hoc paired t-tests (Holm-Bonferroni) ---\n")
+  print(posthoc)
+
+  # ---- Effect sizes ----
+  # For paired data, rstatix::cohens_d returns d_z
+  # (mean difference / SD of the differences).
+  effect_sizes <- data_long %>%
+    cohens_d(formula_dv, paired = TRUE)
+  cat("\n--- Effect sizes (Cohen's d_z) ---\n")
+  print(effect_sizes)
+
+  # ---- Plot ----
+  # Points are not jittered so the per-participant lines connect to them.
+  p <- ggplot(data_long, aes(x = condition, y = .data[[dv_name]], fill = condition)) +
+    geom_boxplot(alpha = 0.6, outlier.shape = NA, width = 0.5) +
+    geom_line(aes(group = subj), alpha = 0.15, color = "grey40") +
+    geom_point(alpha = 0.4, size = 1.8) +
+    scale_fill_brewer(palette = "Set2") +
+    labs(title = paste(dv_label, "per condition"), x = NULL, y = dv_label) +
+    theme_minimal(base_size = 13) +
+    theme(legend.position = "none")
+
+  list(
+    descriptives   = descriptives,
+    aov            = aov_result,
+    partial_eta_sq = partial_eta_sq,
+    posthoc        = posthoc,
+    effect_sizes   = effect_sizes,
+    plot           = p
+  )
+}
+
+# ==============================================================================
+# Write results to .csv
+# ==============================================================================
+save_results <- function(results, prefix) {
+  write.csv(results$descriptives, paste0(prefix, "_descriptives.csv"), row.names = FALSE)
+  write.csv(results$posthoc,      paste0(prefix, "_posthoc_tests.csv"), row.names = FALSE)
+  write.csv(results$effect_sizes, paste0(prefix, "_effect_sizes.csv"),  row.names = FALSE)
+  write.csv(data.frame(term = names(results$partial_eta_sq),
+                       partial_eta_sq = results$partial_eta_sq),
+            paste0(prefix, "_partial_eta_squared.csv"), row.names = FALSE)
+}
+
+# ==============================================================================
+# 1. Accuracy and reaction time
+# ==============================================================================
+acc_results <- run_analysis(load_condition_data("acc_excl", "accuracy"),
+                            "accuracy", "Accuracy")
+rt_results  <- run_analysis(load_condition_data("RT_excl", "rt"),
+                            "rt", "Reaction time (s)")
+
+# ==============================================================================
+# 2. Combined plot (accuracy axis shown as percentages)
+# ==============================================================================
+acc_results$plot <- acc_results$plot +
+  scale_y_continuous(labels = scales::label_number(scale = 100)) +
+  labs(y = "Accuracy (%)")
+
+combined_plot <- acc_results$plot + rt_results$plot
+print(combined_plot)
+
+ggsave("rt_accuracy_comparison_plot.png", plot = combined_plot,
+       width = 11, height = 5, dpi = 300)
+
+# ==============================================================================
+# 3. Save results
+# ==============================================================================
+save_results(acc_results, "accuracy")
+save_results(rt_results,  "rt")
