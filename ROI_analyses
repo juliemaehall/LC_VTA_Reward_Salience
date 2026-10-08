@@ -1,0 +1,221 @@
+# ==============================================================================
+# ROI analysis: LC and SN/VTA activity per stimulus type
+# (reward, salience, neutral; plus standard in a secondary comparison)
+#
+# Input: one Excel file per ROI with a `subject` column and one column per
+# condition x block (e.g. reward1, reward2, salience1, neutral1, standard1, ...),
+# containing the extracted beta estimates.
+# ==============================================================================
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)     # Q-Q plots
+library(rstatix)
+library(patchwork)  # combining the LC and SN/VTA plots
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+
+oddball_levels <- c("reward", "salience", "neutral")
+all_levels     <- c(oddball_levels, "standard")
+dv_name        <- "beta"
+
+
+  data %>%
+    mutate(subject   = factor(subject),
+           condition = factor(condition, levels = levels),
+           block     = factor(block))
+}
+
+# Remove block-level observations more than `sd_threshold` SD from the condition mean
+remove_outliers <- function(data, sd_threshold = 3) {
+  data_flagged <- data %>%
+    group_by(condition) %>%
+    mutate(z = (.data[[dv_name]] - mean(.data[[dv_name]], na.rm = TRUE)) /
+                sd(.data[[dv_name]], na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(is_outlier = abs(z) > sd_threshold)
+
+  outliers <- filter(data_flagged, is_outlier)
+  cat("Outliers removed (>", sd_threshold, "SD from condition mean):", nrow(outliers), "\n")
+  if (nrow(outliers) > 0) print(select(outliers, subject, condition, block, all_of(dv_name)))
+
+  data_flagged %>%
+    filter(!is_outlier) %>%
+    select(-z, -is_outlier)
+}
+
+# Average over blocks per subject and condition; keep only subjects with
+# data in every condition so that all paired tests use the same sample
+collapse_blocks <- function(data) {
+  collapsed <- data %>%
+    group_by(subject, condition) %>%
+    summarise(!!dv_name := mean(.data[[dv_name]], na.rm = TRUE), .groups = "drop")
+
+  complete <- collapsed %>%
+    group_by(subject) %>%
+    filter(n_distinct(condition) == nlevels(condition)) %>%
+    ungroup()
+
+  n_dropped <- n_distinct(collapsed$subject) - n_distinct(complete$subject)
+  if (n_dropped > 0) cat("Subjects dropped due to missing conditions:", n_dropped, "\n")
+  cat("Subjects in analysis:", n_distinct(complete$subject), "\n")
+
+  complete
+}
+
+describe_conditions <- function(data) {
+  data %>%
+    group_by(condition) %>%
+    summarise(
+      n    = n(),
+      mean = mean(.data[[dv_name]]),
+      sd   = sd(.data[[dv_name]]),
+      se   = sd / sqrt(n),
+      .groups = "drop"
+    )
+}
+
+plot_conditions <- function(data, roi_label) {
+  ggplot(data, aes(x = condition, y = .data[[dv_name]], fill = condition)) +
+    geom_violin(trim = FALSE, alpha = 0.6, color = NA) +
+    geom_jitter(width = 0.1, alpha = 0.4, size = 1.5, color = "grey30") +
+    stat_summary(fun = mean, geom = "point", size = 3, color = "black",
+                 shape = 21, fill = "white", stroke = 1.2) +
+    stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.1,
+                 color = "black", linewidth = 0.7) +
+    scale_fill_brewer(palette = "Set2") +
+    theme_minimal(base_size = 14) +
+    labs(x = "Condition", y = paste0(roi_label, " activity (\u03b2)"),
+         title = paste(roi_label, "activity by condition")) +
+    theme(legend.position = "none",
+          plot.title = element_text(face = "bold", hjust = 0.5),
+          axis.title = element_text(face = "bold"))
+}
+
+# ==============================================================================
+# Main analysis: reward vs. salience vs. neutral
+# Standard trials are excluded here because they required no motor response
+# and are therefore not comparable to the three oddball conditions.
+# ==============================================================================
+run_main_analysis <- function(cfg) {
+  roi_label <- cfg$label
+  cat("\n==================================================================\n")
+  cat("MAIN ANALYSIS:", roi_label, "\n")
+  cat("==================================================================\n")
+
+  data <- load_roi_data(cfg$file, cfg$3cond, oddball_levels) %>%
+    remove_outliers() %>%
+    collapse_blocks()
+
+  formula_dv <- as.formula(paste0(dv_name, " ~ condition"))
+
+  descriptives <- describe_conditions(data)
+  cat("\n--- Descriptive statistics ---\n")
+  print(descriptives)
+
+  # Normality of the subject-level data that enter the ANOVA
+  normality <- data %>% group_by(condition) %>% shapiro_test(!!sym(dv_name))
+  cat("\n--- Shapiro-Wilk test per condition ---\n")
+  print(normality)
+  print(ggqqplot(data, dv_name, facet.by = "condition") +
+          labs(title = paste("Q-Q plots -", roi_label)))
+
+  # Repeated-measures ANOVA; get_anova_table() applies the Greenhouse-Geisser
+  # correction automatically when Mauchly's test indicates a sphericity violation
+  rm_anova <- anova_test(data = data, dv = !!dv_name, wid = subject,
+                         within = condition, effect.size = "pes")
+  anova_table <- get_anova_table(rm_anova)
+  cat("\n--- Repeated-measures ANOVA ---\n")
+  print(anova_table)
+
+  posthoc <- data %>%
+    pairwise_t_test(formula_dv, paired = TRUE, p.adjust.method = "holm")
+  cat("\n--- Post-hoc paired t-tests (Holm-Bonferroni) ---\n")
+  print(posthoc)
+
+  # For paired data, cohens_d returns d_z (mean difference / SD of differences)
+  effect_sizes <- data %>% cohens_d(formula_dv, paired = TRUE)
+  cat("\n--- Effect sizes (Cohen's d_z) ---\n")
+  print(effect_sizes)
+
+  p <- plot_conditions(data, roi_label)
+  print(p)
+
+  list(descriptives = descriptives, normality = normality, rm_anova = anova_table,
+       posthoc = posthoc, effect_sizes = effect_sizes, plot = p)
+}
+
+# ==============================================================================
+# Secondary analysis: each oddball condition vs. standard
+# (Holm correction over these three comparisons only)
+# ==============================================================================
+run_standard_comparison <- function(cfg) {
+  roi_label <- cfg$label
+  cat("\n==================================================================\n")
+  cat("ODDBALL vs. STANDARD:", roi_label, "\n")
+  cat("==================================================================\n")
+
+  data <- load_roi_data(cfg$file, cfg$4cond, all_levels) %>%
+    remove_outliers() %>%
+    collapse_blocks()
+
+  formula_dv <- as.formula(paste0(dv_name, " ~ condition"))
+
+  descriptives <- describe_conditions(data)
+  cat("\n--- Descriptive statistics incl. standard ---\n")
+  print(descriptives)
+
+  tests <- data %>%
+    pairwise_t_test(formula_dv, paired = TRUE, ref.group = "standard",
+                    p.adjust.method = "holm")
+  cat("\n--- Each oddball condition vs. standard (Holm-Bonferroni) ---\n")
+  print(tests)
+
+  effect_sizes <- data %>% cohens_d(formula_dv, paired = TRUE, ref.group = "standard")
+  cat("\n--- Effect sizes vs. standard (Cohen's d_z) ---\n")
+  print(effect_sizes)
+
+  p <- plot_conditions(data, roi_label)
+  print(p)
+
+  list(descriptives = descriptives, tests = tests,
+       effect_sizes = effect_sizes, plot = p)
+}
+
+# ==============================================================================
+# Run
+# ==============================================================================
+lc_results           <- run_main_analysis(roi_config$LC)
+lc_vs_standard       <- run_standard_comparison(roi_config$LC)
+vta_results          <- run_main_analysis(roi_config$VTA)
+vta_vs_standard      <- run_standard_comparison(roi_config$VTA)
+
+# Combined figure: SN/VTA and LC side by side, including the standard condition
+combined_plot <- vta_vs_standard$plot + lc_vs_standard$plot
+print(combined_plot)
+ggsave("LC_VTA_combined_plot.png", plot = combined_plot,
+       width = 11, height = 5, dpi = 300)
+
+# ==============================================================================
+# Save results
+# ==============================================================================
+save_results <- function(main, vs_standard, prefix) {
+  write.csv(main$descriptives,        paste0(prefix, "_descriptives.csv"),          row.names = FALSE)
+  write.csv(main$rm_anova,            paste0(prefix, "_rm_anova.csv"),              row.names = FALSE)
+  write.csv(main$posthoc,             paste0(prefix, "_posthoc_tests.csv"),         row.names = FALSE)
+  write.csv(main$effect_sizes,        paste0(prefix, "_effect_sizes.csv"),          row.names = FALSE)
+  write.csv(vs_standard$descriptives, paste0(prefix, "_descriptives_standard.csv"), row.names = FALSE)
+  write.csv(vs_standard$tests,        paste0(prefix, "_vs_standard_tests.csv"),     row.names = FALSE)
+  write.csv(vs_standard$effect_sizes, paste0(prefix, "_vs_standard_effect_sizes.csv"), row.names = FALSE)
+}
+
+save_results(lc_results,  lc_vs_standard,  "LC")
+save_results(vta_results, vta_vs_standard, "VTA")
+
+saveRDS(list(LC  = list(main = lc_results,  vs_standard = lc_vs_standard),
+             VTA = list(main = vta_results, vs_standard = vta_vs_standard)),
+        "ROI_results.rds")
